@@ -90,7 +90,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
                 let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
                 let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-
                 if magic != 0x11223344 {
                     eprintln!("Invalid magic number");
                     break;
@@ -105,8 +104,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut a = client_id2addr_clone.lock().await;
                 a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
 
-                let mut a = client_addr2id_clone.lock().await;
-                a.entry(socket_address.clone()).or_insert(client_id);
+                let mut b = client_addr2id_clone.lock().await;
+
+                if !b.contains_key(&socket_address) {
+                    socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
+                }
+
+
+                b.entry(socket_address.clone()).or_insert(client_id);
+
+
                 let msg_block = MsgBlock {
                     magic,
                     cmd,
@@ -131,10 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     map.remove(&client_id);
                     except_id.remove(&client_id);
                     client_msg.remove(&client_id);
+                    println!("Client {} disconnected", client_id);
                 }
             }
-
-            println!("Client {} disconnected", addr);
         });
     }
 }
