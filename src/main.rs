@@ -12,21 +12,39 @@ struct MsgBlock {
     cmd: u32,
     client_id: u32,
     data_size: u32,
-    server_seq: u32,
-    client_seq: u32,
+    seq: u32,
     data: Vec<u8>,
 }
 lazy_static! {
     static ref CLIENT_MSG: Arc<Mutex<HashMap<u32, BTreeMap<u32, Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref EXCEPT_ID:Arc<Mutex<HashMap<u32,u32>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 type SocketMap = Arc<Mutex<HashMap<u32, Vec<Arc<Mutex<TcpStream>>>>>>;
 
 async fn handle_msg(socket: &mut TcpStream, msg_block: MsgBlock) {
-    // 处理消息的逻辑
     let client_id = msg_block.client_id;
-    let client_seq = msg_block.client_seq;
-    let mut rs = CLIENT_MSG.lock().await;
-    rs.entry(client_id).or_insert_with(BTreeMap::new).insert(client_seq,msg_block.data);
+    let client_seq = msg_block.seq;
+
+    let mut client_msg_map = CLIENT_MSG.lock().await;
+    client_msg_map
+        .entry(client_id)
+        .or_insert_with(BTreeMap::new)
+        .insert(client_seq, msg_block.data);
+
+    let mut except_id_map = EXCEPT_ID.lock().await;
+    let except_id = *except_id_map.entry(client_id).or_insert(0);
+
+    if let Some(data_map) = client_msg_map.get_mut(&client_id) {
+        if let Some(recv_data) = data_map.get(&except_id) {
+            println!("Received data for client {}, sequence {}: {:?}", client_id, except_id, recv_data);
+            data_map.remove(&except_id);
+            except_id_map.insert(client_id, except_id + 1);
+        } else {
+            //println!("No data found for client {}, sequence {}", client_id, except_id);
+        }
+    } else {
+        //println!("No data map found for client {}", client_id);
+    }
 }
 
 #[tokio::main]
@@ -35,18 +53,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server listening on 127.0.0.1:8080");
 
     let socket_map: SocketMap = Arc::new(Mutex::new(HashMap::new()));
-    // let client_msg: Arc<Mutex<HashMap<String, BTreeMap<u32, Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let addr2socket: Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let client_id2addr: Arc<Mutex<HashMap<u32, HashSet<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let client_addr2id: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     loop {
         let (socket, addr) = listener.accept().await?;
         println!("New client connected: {}", addr);
 
         let socket_arc = Arc::new(Mutex::new(socket));
         let socket_map_clone = Arc::clone(&socket_map);
-        // let client_msg_clone = Arc::clone(&client_msg);
         let socket_clone = Arc::clone(&socket_arc);
         let client_id2addr_clone = client_id2addr.clone();
+        let client_addr2id_clone = client_addr2id.clone();
+        let client_addr2id_clone2 = client_addr2id.clone();
         let socket_address: String = addr.to_string();
         let mut a = addr2socket.lock().await;
         a.entry(socket_address.clone()).or_insert(socket_arc.clone());
@@ -55,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             loop {
                 let mut socket = socket_clone.lock().await;
-                let mut header = [0u8; 24];
+                let mut header = [0u8; 20];
                 match socket.read_exact(&mut header).await {
                     Ok(0) => break, // Connection closed
                     Ok(_) => (),
@@ -67,11 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut cursor = Cursor::new(header);
                 let magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
                 let cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
                 let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let server_seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let client_seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
 
                 if magic != 0x11223344 {
                     eprintln!("Invalid magic number");
@@ -87,13 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut a = client_id2addr_clone.lock().await;
                 a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
 
+                let mut a = client_addr2id_clone.lock().await;
+                a.entry(socket_address.clone()).or_insert(client_id);
                 let msg_block = MsgBlock {
                     magic,
                     cmd,
                     client_id,
                     data_size,
-                    server_seq,
-                    client_seq,
+                    seq,
                     data,
                 };
 
@@ -102,11 +121,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 当连接关闭时，从 HashMap 中移除这个 socket
+            let client_id = client_addr2id_clone2.lock().await.get(&socket_address).unwrap().clone();
             let mut map = socket_map_clone.lock().await;
+            let mut except_id = EXCEPT_ID.lock().await;
+            let mut client_msg = CLIENT_MSG.lock().await;
             if let Some(sockets) = map.get_mut(&client_id) {
                 sockets.retain(|s| !Arc::ptr_eq(s, &socket_clone));
                 if sockets.is_empty() {
                     map.remove(&client_id);
+                    except_id.remove(&client_id);
+                    client_msg.remove(&client_id);
                 }
             }
 
