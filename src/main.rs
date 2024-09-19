@@ -9,7 +9,7 @@ use std::time::Duration;
 use lazy_static::lazy_static;
 use tokio::time::timeout;
 
-const TIMEOUT_DURATION: Duration = Duration::from_secs(5);
+const TIMEOUT_DURATION: Duration = Duration::from_secs(15);
 
 struct MsgBlock {
     magic: u32,
@@ -50,7 +50,7 @@ impl ClientManager {
         if let Some(data_map) = client_msg_map.get_mut(&client_id) {
             if let Some(recv_data) = data_map.get(&except_id) {
                 self.write_to(client_id, recv_data.clone()).await;
-                println!("回写");
+                // println!("回写");
                 data_map.remove(&except_id);
                 except_id_map.insert(client_id, except_id + 1);
             }
@@ -112,7 +112,7 @@ impl Server {
 
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("0.0.0.0:8080").await?;
-        println!("Server listening on 127.0.0.1:8080");
+        println!("Server listening on 0.0.0.0:8080");
 
         loop {
             let (socket, addr) = listener.accept().await?;
@@ -153,12 +153,12 @@ impl Server {
                 Ok(Some(block)) => block,
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("Error reading message: {}", e);
+                    // eprintln!("Error reading message: {}", e);
                     break;
                 }
             };
             is_has_clientid = true;
-            println!("{} #### {}", socket_address, msg_block.client_id);
+            // println!("{} #### {}", socket_address, msg_block.client_id);
             {
                 let mut b = client_addr2id_clone.lock().await;
                 if !b.contains_key(&socket_address) {
@@ -220,7 +220,6 @@ impl Server {
         socket_address: &str,
         socket_clone: &Arc<Mutex<TcpStream>>,
     ) {
-        println!("remove_disconnected_client");
         let mut client_msg = client_manager.client_msg.lock().await;
         let mut except_id = client_manager.except_id.lock().await;
         let mut sender_id = client_manager.sender_id.lock().await;
