@@ -51,8 +51,7 @@ impl ClientManager {
 
         if let Some(data_map) = client_msg_map.get_mut(&client_id) {
             if let Some(recv_data) = data_map.get(&except_id) {
-                println!("Received data for client {}, sequence {}: {:?}", client_id, except_id, recv_data);
-                self.write_to(client_id, "helloworld".as_bytes().to_vec()).await;
+                self.write_to(client_id, recv_data.clone()).await;
                 data_map.remove(&except_id);
                 except_id_map.insert(client_id, except_id + 1);
             }
