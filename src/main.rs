@@ -6,9 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use lazy_static::lazy_static;
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 
+const TIMEOUT_DURATION: Duration = Duration::from_secs(5); // 5秒超时
 
 struct MsgBlock {
     magic: u32, //0x11223344
@@ -36,7 +39,7 @@ async fn handle_msg(msg_block: MsgBlock) {
         .entry(client_id)
         .or_insert_with(BTreeMap::new)
         .insert(client_seq, msg_block.data);
-    let mut except_id_clone = EXCEPT_ID.clone();
+    let except_id_clone = EXCEPT_ID.clone();
     let mut except_id_map = except_id_clone.lock().await;
     let except_id = *except_id_map.entry(client_id).or_insert(0);
 
@@ -57,7 +60,7 @@ async fn write_to(client_id: u32, data: Vec<u8>) {
 
     // 构造 MsgBlock 结构
     let msg_block = {
-        let mut sender_id_clone = SENDER_ID.clone();
+        let sender_id_clone = SENDER_ID.clone();
         let mut sender_id_map = sender_id_clone.lock().await;
         let seq = *(sender_id_map.entry(client_id).or_insert(0));
 
@@ -104,25 +107,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server listening on 127.0.0.1:8080");
 
 
-    let addr2socket: Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let client_id2addr: Arc<Mutex<HashMap<u32, HashSet<String>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let client_addr2id: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let client_id2addr: Arc<Mutex<HashMap<u32, HashSet<String>>>> = Arc::new(tokio::sync::Mutex ::new(HashMap::new()));
+    let client_addr2id: Arc<Mutex<HashMap<String, u32>>> = Arc::new(tokio::sync::Mutex ::new(HashMap::new()));
     loop {
         let (socket, addr) = listener.accept().await?;
         println!("New client connected: {}", addr);
 
-        let socket_arc = Arc::new(Mutex::new(socket));
+        let socket_arc = Arc::new(tokio::sync::Mutex ::new(socket));
         let socket_clone = Arc::clone(&socket_arc);
         let client_id2addr_clone = client_id2addr.clone();
         let client_addr2id_clone = client_addr2id.clone();
         let client_addr2id_clone2 = client_addr2id.clone();
-        let mut except_id_clone = EXCEPT_ID.clone();
+        let except_id_clone = EXCEPT_ID.clone();
         let socket_address: String = addr.to_string();
-        {
-            let addr2socket_clone = addr2socket.clone();
-            let mut a = addr2socket_clone.lock().await;
-            a.entry(socket_address.clone()).or_insert(socket_arc.clone());
-        }
         tokio::spawn(async move {
             loop {
                 let msg_block: MsgBlock;
@@ -134,13 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut seq = 0;
                     let mut data: Vec<u8>;
                     {
-                        let mut socket = socket_clone.lock().await;
                         let mut header = [0u8; 20];
-                        match socket.read_exact(&mut header).await {
-                            Ok(0) => break, // Connection closed
-                            Ok(_) => (),
-                            Err(e) => {
+                        let mut socket_clone_c = socket_clone.clone();
+                        let mut socket = socket_clone_c.lock().await;
+                        match timeout(TIMEOUT_DURATION, socket.read_exact(&mut header)).await {
+                            Ok(Ok(0)) => break, // Connection closed
+                            Ok(Ok(_)) => (),
+                            Ok(Err(e)) => {
                                 eprintln!("Failed to read from socket: {}", e);
+                                break;
+                            }
+                            Err(_) => {
+                                eprintln!("Read operation timed out");
                                 break;
                             }
                         }
@@ -174,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let client_addr2id_clone_c = client_addr2id_clone.clone();
                         let mut b = client_addr2id_clone_c.lock().await;
                         if !b.contains_key(&socket_address) {
-                            let socket_map_clone = Arc::clone(&SOCKET_MAP);
+                            let socket_map_clone = SOCKET_MAP.clone();
                             socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
                         }
                         b.entry(socket_address.clone()).or_insert(client_id);
@@ -196,28 +198,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 当连接关闭时，从 HashMap 中移除这个 socket
-            println!("666666666");
-            let client_id = client_addr2id_clone2.lock().await.get(&socket_address).unwrap().clone();
-            let socket_map_clone2 = Arc::clone(&SOCKET_MAP);
-            let mut map = socket_map_clone2.lock().await;
-            println!("11111");
-            let mut client_msg_map_clone = CLIENT_MSG.clone();
-            println!("33333");
-            if let Some(sockets) = map.get_mut(&client_id) {
-                sockets.retain(|s| !Arc::ptr_eq(s, &socket_clone));
-                if sockets.is_empty() {
-                    map.remove(&client_id);
-                    {
-                        let mut except_id = except_id_clone.lock().await;
-                        println!("22222");
+            {
+                let client_msg_map_clone = CLIENT_MSG.clone();
+                println!("555");
+                let mut client_msg = client_msg_map_clone.lock().await;
+                println!("222");
+                let mut except_id = except_id_clone.lock().await;
+                println!("444");
+                let client_id = client_addr2id_clone2.lock().await.get(&socket_address).unwrap().clone();
+                let socket_map_clone2 = SOCKET_MAP.clone();
+                let mut map = socket_map_clone2.lock().await;
+                println!("333");
+
+
+
+                if let Some(sockets) = map.get_mut(&client_id) {
+                    sockets.retain(|s| !Arc::ptr_eq(s, &socket_clone));
+                    if sockets.is_empty() {
+                        map.remove(&client_id);
                         except_id.remove(&client_id);
-                    }
-                    {
-                        let mut client_msg = client_msg_map_clone.lock().await;
-                        println!("777777777");
                         client_msg.remove(&client_id);
+                        println!("Client {} disconnected", client_id);
                     }
-                    println!("Client {} disconnected", client_id);
                 }
             }
         });
