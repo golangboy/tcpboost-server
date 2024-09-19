@@ -26,6 +26,7 @@ lazy_static! {
 }
 type SocketMap = Arc<Mutex<HashMap<u32, Vec<Arc<Mutex<TcpStream>>>>>>;
 
+// CLIENT_MSG EXCEPT_ID SENDER_ID
 async fn handle_msg(msg_block: MsgBlock) {
     let client_id = msg_block.client_id;
     let client_seq = msg_block.seq;
@@ -87,10 +88,10 @@ async fn write_to(client_id: u32, data: Vec<u8>) {
     let socket_map = socket_map_clone.lock().await;
     if let Some(sockets) = socket_map.get(&client_id) {
         for socket_arc in sockets {
-            let mut socket = socket_arc.lock().await;
-            if let Err(e) = socket.write_all(&serialized).await {
-                eprintln!("Failed to write to socket for client {}: {}", client_id, e);
-            }
+            // let mut socket = socket_arc.lock().await;
+            // if let Err(e) = socket.write_all(&serialized).await {
+            //     eprintln!("Failed to write to socket for client {}: {}", client_id, e);
+            // }
         }
     } else {
         println!("No sockets found for client {}", client_id);
@@ -111,17 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("New client connected: {}", addr);
 
         let socket_arc = Arc::new(Mutex::new(socket));
-        let socket_map_clone = Arc::clone(&SOCKET_MAP);
-        let socket_map_clone2 = Arc::clone(&SOCKET_MAP);
         let socket_clone = Arc::clone(&socket_arc);
         let client_id2addr_clone = client_id2addr.clone();
         let client_addr2id_clone = client_addr2id.clone();
         let client_addr2id_clone2 = client_addr2id.clone();
         let mut except_id_clone = EXCEPT_ID.clone();
-        let mut client_msg_map_clone = CLIENT_MSG.clone();
-        let addr2socket_clone = addr2socket.clone();
         let socket_address: String = addr.to_string();
         {
+            let addr2socket_clone = addr2socket.clone();
             let mut a = addr2socket_clone.lock().await;
             a.entry(socket_address.clone()).or_insert(socket_arc.clone());
         }
@@ -129,45 +127,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let msg_block: MsgBlock;
                 {
-                    let mut socket = socket_clone.lock().await;
-                    let mut header = [0u8; 20];
-                    match socket.read_exact(&mut header).await {
-                        Ok(0) => break, // Connection closed
-                        Ok(_) => (),
-                        Err(e) => {
-                            eprintln!("Failed to read from socket: {}", e);
+                    let mut client_id = 0;
+                    let mut magic = 0;
+                    let mut cmd = 0;
+                    let mut data_size = 0;
+                    let mut seq = 0;
+                    let mut data: Vec<u8>;
+                    {
+                        let mut socket = socket_clone.lock().await;
+                        let mut header = [0u8; 20];
+                        match socket.read_exact(&mut header).await {
+                            Ok(0) => break, // Connection closed
+                            Ok(_) => (),
+                            Err(e) => {
+                                eprintln!("Failed to read from socket: {}", e);
+                                break;
+                            }
+                        }
+
+                        let mut cursor = Cursor::new(header);
+                        magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                        cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                        client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                        data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                        seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                        if magic != 0x11223344 {
+                            eprintln!("Invalid magic number");
+                            break;
+                        }
+
+
+                        data = vec![0u8; data_size as usize];
+                        if let Err(e) = socket.read_exact(&mut data).await {
+                            eprintln!("Failed to read data: {}", e);
                             break;
                         }
                     }
 
-                    let mut cursor = Cursor::new(header);
-                    let magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                    let cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                    let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                    let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                    let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                    if magic != 0x11223344 {
-                        eprintln!("Invalid magic number");
-                        break;
+                    {
+                        let client_id2addr_clone_c = client_id2addr_clone.clone();
+                        let mut a = client_id2addr_clone_c.lock().await;
+                        a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
                     }
 
-
-                    let mut data = vec![0u8; data_size as usize];
-                    if let Err(e) = socket.read_exact(&mut data).await {
-                        eprintln!("Failed to read data: {}", e);
-                        break;
+                    {
+                        let client_addr2id_clone_c = client_addr2id_clone.clone();
+                        let mut b = client_addr2id_clone_c.lock().await;
+                        if !b.contains_key(&socket_address) {
+                            let socket_map_clone = Arc::clone(&SOCKET_MAP);
+                            socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
+                        }
+                        b.entry(socket_address.clone()).or_insert(client_id);
                     }
-                    let mut a = client_id2addr_clone.lock().await;
-                    a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
-
-                    let mut b = client_addr2id_clone.lock().await;
-
-                    if !b.contains_key(&socket_address) {
-                        socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
-                    }
-
-
-                    b.entry(socket_address.clone()).or_insert(client_id);
 
 
                     msg_block = MsgBlock {
@@ -185,21 +196,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 当连接关闭时，从 HashMap 中移除这个 socket
-            println!("6666666");
+            println!("666666666");
             let client_id = client_addr2id_clone2.lock().await.get(&socket_address).unwrap().clone();
-            println!("777777");
+            let socket_map_clone2 = Arc::clone(&SOCKET_MAP);
             let mut map = socket_map_clone2.lock().await;
-            println!("888888");
-            let mut except_id = except_id_clone.lock().await;
-            println!("999999");
-            let mut client_msg = client_msg_map_clone.lock().await;
-            println!("{} ### {}", client_id, addr);
+            println!("11111");
+            let mut client_msg_map_clone = CLIENT_MSG.clone();
+            println!("33333");
             if let Some(sockets) = map.get_mut(&client_id) {
                 sockets.retain(|s| !Arc::ptr_eq(s, &socket_clone));
                 if sockets.is_empty() {
                     map.remove(&client_id);
-                    except_id.remove(&client_id);
-                    client_msg.remove(&client_id);
+                    {
+                        let mut except_id = except_id_clone.lock().await;
+                        println!("22222");
+                        except_id.remove(&client_id);
+                    }
+                    {
+                        let mut client_msg = client_msg_map_clone.lock().await;
+                        println!("777777777");
+                        client_msg.remove(&client_id);
+                    }
                     println!("Client {} disconnected", client_id);
                 }
             }
