@@ -45,10 +45,8 @@ impl ClientManager {
             .entry(client_id)
             .or_insert_with(BTreeMap::new)
             .insert(client_seq, msg_block.data);
-
         let mut except_id_map = self.except_id.lock().await;
         let except_id = *except_id_map.entry(client_id).or_insert(0);
-
         if let Some(data_map) = client_msg_map.get_mut(&client_id) {
             if let Some(recv_data) = data_map.get(&except_id) {
                 self.write_to(client_id, recv_data.clone()).await;
@@ -118,7 +116,7 @@ impl Server {
 
         loop {
             let (socket, addr) = listener.accept().await?;
-            println!("New client connected: {}", addr);
+            // println!("New client connected: {}", addr);
 
             let socket_arc = Arc::new(tokio::sync::Mutex::new(socket));
             let socket_clone = Arc::clone(&socket_arc);
@@ -163,11 +161,11 @@ impl Server {
             println!("{} #### {}", socket_address, msg_block.client_id);
             {
                 let mut b = client_addr2id_clone.lock().await;
-                b.entry(socket_address.clone()).or_insert(msg_block.client_id);
                 if !b.contains_key(&socket_address) {
                     let mut socket_map = client_manager.socket_map.lock().await;
                     socket_map.entry(msg_block.client_id).or_insert_with(Vec::new).push(socket_clone.clone());
                 }
+                b.entry(socket_address.clone()).or_insert(msg_block.client_id);
             }
             {
                 let mut a = client_id2addr_clone.lock().await;
@@ -222,12 +220,12 @@ impl Server {
         socket_address: &str,
         socket_clone: &Arc<Mutex<TcpStream>>,
     ) {
+        println!("remove_disconnected_client");
         let mut client_msg = client_manager.client_msg.lock().await;
         let mut except_id = client_manager.except_id.lock().await;
         let mut sender_id = client_manager.sender_id.lock().await;
         let client_id = client_addr2id.lock().await.get(socket_address).unwrap().clone();
         let mut map = client_manager.socket_map.lock().await;
-
         if let Some(sockets) = map.get_mut(&client_id) {
             sockets.retain(|s| !Arc::ptr_eq(s, socket_clone));
             if sockets.is_empty() {
