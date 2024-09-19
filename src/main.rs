@@ -52,6 +52,7 @@ impl ClientManager {
         if let Some(data_map) = client_msg_map.get_mut(&client_id) {
             if let Some(recv_data) = data_map.get(&except_id) {
                 self.write_to(client_id, recv_data.clone()).await;
+                println!("回写");
                 data_map.remove(&except_id);
                 except_id_map.insert(client_id, except_id + 1);
             }
@@ -148,6 +149,7 @@ impl Server {
         client_addr2id_clone2: Arc<Mutex<HashMap<String, u32>>>,
         socket_address: String,
     ) {
+        let mut is_has_clientid = false;
         loop {
             let msg_block = match Self::read_msg_block(&socket_clone).await {
                 Ok(Some(block)) => block,
@@ -157,26 +159,27 @@ impl Server {
                     break;
                 }
             };
-
+            is_has_clientid = true;
+            println!("{} #### {}", socket_address, msg_block.client_id);
+            {
+                let mut b = client_addr2id_clone.lock().await;
+                b.entry(socket_address.clone()).or_insert(msg_block.client_id);
+                if !b.contains_key(&socket_address) {
+                    let mut socket_map = client_manager.socket_map.lock().await;
+                    socket_map.entry(msg_block.client_id).or_insert_with(Vec::new).push(socket_clone.clone());
+                }
+            }
             {
                 let mut a = client_id2addr_clone.lock().await;
                 a.entry(msg_block.client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
             }
 
-            {
-                let mut b = client_addr2id_clone.lock().await;
-                if !b.contains_key(&socket_address) {
-                    let mut socket_map = client_manager.socket_map.lock().await;
-                    socket_map.entry(msg_block.client_id).or_insert_with(Vec::new).push(socket_clone.clone());
-                }
-                b.entry(socket_address.clone()).or_insert(msg_block.client_id);
-            }
-
             client_manager.handle_msg(msg_block).await;
         }
-
-        // 当连接关闭时，从 HashMap 中移除这个 socket
-        Self::remove_disconnected_client(&client_manager, &client_addr2id_clone2, &socket_address, &socket_clone).await;
+        if (is_has_clientid) {
+            // 当连接关闭时，从 HashMap 中移除这个 socket
+            Self::remove_disconnected_client(&client_manager, &client_addr2id_clone2, &socket_address, &socket_clone).await;
+        }
     }
 
     async fn read_msg_block(socket_clone: &Arc<Mutex<TcpStream>>) -> Result<Option<MsgBlock>, Box<dyn std::error::Error>> {
@@ -221,6 +224,7 @@ impl Server {
     ) {
         let mut client_msg = client_manager.client_msg.lock().await;
         let mut except_id = client_manager.except_id.lock().await;
+        let mut sender_id = client_manager.sender_id.lock().await;
         let client_id = client_addr2id.lock().await.get(socket_address).unwrap().clone();
         let mut map = client_manager.socket_map.lock().await;
 
@@ -230,6 +234,7 @@ impl Server {
                 map.remove(&client_id);
                 except_id.remove(&client_id);
                 client_msg.remove(&client_id);
+                sender_id.remove(&client_id);
                 println!("Client {} disconnected", client_id);
             }
         }
