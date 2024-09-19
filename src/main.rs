@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use std::collections::BTreeMap;
 use lazy_static::lazy_static;
 use tokio::io::AsyncWriteExt;
+
+
 struct MsgBlock {
     magic: u32, //0x11223344
     cmd: u32,
@@ -24,7 +26,7 @@ lazy_static! {
 }
 type SocketMap = Arc<Mutex<HashMap<u32, Vec<Arc<Mutex<TcpStream>>>>>>;
 
-async fn handle_msg(socket: &mut TcpStream, msg_block: MsgBlock) {
+async fn handle_msg(msg_block: MsgBlock) {
     let client_id = msg_block.client_id;
     let client_seq = msg_block.seq;
 
@@ -40,7 +42,7 @@ async fn handle_msg(socket: &mut TcpStream, msg_block: MsgBlock) {
     if let Some(data_map) = client_msg_map.get_mut(&client_id) {
         if let Some(recv_data) = data_map.get(&except_id) {
             println!("Received data for client {}, sequence {}: {:?}", client_id, except_id, recv_data);
-            write_to(client_id,"helloworld".as_bytes().to_vec()).await;
+            write_to(client_id, "helloworld".as_bytes().to_vec()).await;
             data_map.remove(&except_id);
             except_id_map.insert(client_id, except_id + 1);
         } else {
@@ -117,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let socket_arc = Arc::new(Mutex::new(socket));
         let socket_map_clone = Arc::clone(&SOCKET_MAP);
         let socket_clone = Arc::clone(&socket_arc);
+        let socket_clone2 = Arc::clone(&socket_arc);
         let client_id2addr_clone = client_id2addr.clone();
         let client_addr2id_clone = client_addr2id.clone();
         let client_addr2id_clone2 = client_addr2id.clone();
@@ -127,58 +130,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut client_id = 0;
 
             loop {
-                let mut socket = socket_clone.lock().await;
-                let mut header = [0u8; 20];
-                match socket.read_exact(&mut header).await {
-                    Ok(0) => break, // Connection closed
-                    Ok(_) => (),
-                    Err(e) => {
-                        eprintln!("Failed to read from socket: {}", e);
+                let msg_block: MsgBlock;
+                {
+                    let mut socket = socket_clone.lock().await;
+                    let mut header = [0u8; 20];
+                    match socket.read_exact(&mut header).await {
+                        Ok(0) => break, // Connection closed
+                        Ok(_) => (),
+                        Err(e) => {
+                            eprintln!("Failed to read from socket: {}", e);
+                            break;
+                        }
+                    }
+
+                    let mut cursor = Cursor::new(header);
+                    let magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                    let cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                    let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                    let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                    let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
+                    if magic != 0x11223344 {
+                        eprintln!("Invalid magic number");
                         break;
                     }
+
+
+                    let mut data = vec![0u8; data_size as usize];
+                    if let Err(e) = socket.read_exact(&mut data).await {
+                        eprintln!("Failed to read data: {}", e);
+                        break;
+                    }
+                    let mut a = client_id2addr_clone.lock().await;
+                    a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
+
+                    let mut b = client_addr2id_clone.lock().await;
+
+                    if !b.contains_key(&socket_address) {
+                        socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
+                    }
+
+
+                    b.entry(socket_address.clone()).or_insert(client_id);
+
+
+                    msg_block = MsgBlock {
+                        magic,
+                        cmd,
+                        client_id,
+                        data_size,
+                        seq,
+                        data,
+                    };
                 }
 
-                let mut cursor = Cursor::new(header);
-                let magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor).unwrap();
-                if magic != 0x11223344 {
-                    eprintln!("Invalid magic number");
-                    break;
-                }
 
-
-                let mut data = vec![0u8; data_size as usize];
-                if let Err(e) = socket.read_exact(&mut data).await {
-                    eprintln!("Failed to read data: {}", e);
-                    break;
-                }
-                let mut a = client_id2addr_clone.lock().await;
-                a.entry(client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
-
-                let mut b = client_addr2id_clone.lock().await;
-
-                if !b.contains_key(&socket_address) {
-                    socket_map_clone.lock().await.entry(client_id).or_insert_with(Vec::new).push(socket_arc.clone());
-                }
-
-
-                b.entry(socket_address.clone()).or_insert(client_id);
-
-
-                let msg_block = MsgBlock {
-                    magic,
-                    cmd,
-                    client_id,
-                    data_size,
-                    seq,
-                    data,
-                };
-
-
-                handle_msg(&mut *socket, msg_block).await;
+                handle_msg(msg_block).await;
             }
 
             // 当连接关闭时，从 HashMap 中移除这个 socket
