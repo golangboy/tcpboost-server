@@ -84,14 +84,10 @@ async fn write_to(client_id: u32, data: Vec<u8>) {
     serialized.extend_from_slice(&msg_block.data);
 
     // 获取客户端 ID 的所有 socket
-    println!("4444");
     let socket_map = SOCKET_MAP.lock().await;
-    println!("5555");
     if let Some(sockets) = socket_map.get(&client_id) {
         for socket_arc in sockets {
-            println!("6666");
             let mut socket = socket_arc.lock().await;
-            println!("7777");
             if let Err(e) = socket.write_all(&serialized).await {
                 eprintln!("Failed to write to socket for client {}: {}", client_id, e);
             }
@@ -99,8 +95,6 @@ async fn write_to(client_id: u32, data: Vec<u8>) {
     } else {
         println!("No sockets found for client {}", client_id);
     }
-
-    println!("222");
 }
 
 #[tokio::main]
@@ -192,7 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut map = socket_map_clone.lock().await;
             let mut except_id = EXCEPT_ID.lock().await;
             let mut client_msg = CLIENT_MSG.lock().await;
-            println!("111");
             if let Some(sockets) = map.get_mut(&client_id) {
                 sockets.retain(|s| !Arc::ptr_eq(s, &socket_clone));
                 if sockets.is_empty() {
