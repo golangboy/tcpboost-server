@@ -5,6 +5,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use std::ptr;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt as _;
+use std::time::Instant;
+
 #[derive(Debug, Clone)]
 struct MsgBlock {
     magic: u32,
@@ -15,7 +19,6 @@ struct MsgBlock {
     data: Vec<u8>,
 }
 
-
 struct ClientManager {
     client_msg: Arc<Mutex<HashMap<u32, BTreeMap<u32, Vec<u8>>>>>,
     except_id: Arc<Mutex<HashMap<u32, u32>>>,
@@ -23,10 +26,20 @@ struct ClientManager {
     connect_num: Arc<Mutex<HashMap<u32, u32>>>,
     broadcast_sender: Arc<Mutex<HashMap<u32, Vec<mpsc::Sender<Vec<u8>>>>>>,
     pending_messages: Arc<Mutex<HashMap<u32, VecDeque<(u32, Vec<u8>)>>>>,
+    file: Arc<Mutex<tokio::fs::File>>,
+    total_data_size: Arc<Mutex<usize>>,
+    start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ClientManager {
-    fn new() -> Self {
+    async fn new() -> Self {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("aa.bin")
+            .await
+            .expect("Failed to open aa.bin");
+
         ClientManager {
             client_msg: Arc::new(Mutex::new(HashMap::new())),
             except_id: Arc::new(Mutex::new(HashMap::new())),
@@ -34,12 +47,31 @@ impl ClientManager {
             connect_num: Arc::new(Mutex::new(HashMap::new())),
             broadcast_sender: Arc::new(Mutex::new(HashMap::new())),
             pending_messages: Arc::new(Mutex::new(HashMap::new())),
+            file: Arc::new(Mutex::new(file)),
+            total_data_size: Arc::new(Mutex::new(0)),
+            start_time: Arc::new(Mutex::new(None)),
         }
     }
 
     async fn handle_msg(&self, msg_block: MsgBlock) {
         let client_id = msg_block.client_id;
         let client_seq = msg_block.seq;
+
+        let mut start_time = self.start_time.lock().await;
+        if start_time.is_none() {
+            *start_time = Some(Instant::now());
+        }
+        drop(start_time);
+
+        let mut total_data_size = self.total_data_size.lock().await;
+        *total_data_size += msg_block.data.len();
+
+        if *total_data_size >= 2000000 {
+            let elapsed = self.start_time.lock().await.unwrap().elapsed();
+            println!("Time taken to receive {:?} bytes: {:?}",*total_data_size, elapsed);
+            std::process::exit(0);
+        }
+        drop(total_data_size);
 
         let mut pending_messages = self.pending_messages.lock().await;
         let pending = pending_messages.entry(client_id).or_insert_with(VecDeque::new);
@@ -70,7 +102,14 @@ impl ClientManager {
         drop(except_id_map);
 
         for data in to_write {
-            self.write_to(client_id, data).await;
+            self.write_to_file(data).await;
+        }
+    }
+
+    async fn write_to_file(&self, data: Vec<u8>) {
+        let mut file = self.file.lock().await;
+        if let Err(e) = file.write_all(&data).await {
+            eprintln!("Failed to write to aa.bin: {}", e);
         }
     }
 
@@ -143,9 +182,9 @@ struct Server {
 }
 
 impl Server {
-    fn new() -> Self {
+    async fn new() -> Self {
         Server {
-            client_manager: Arc::new(ClientManager::new()),
+            client_manager: Arc::new(ClientManager::new().await),
         }
     }
 
@@ -234,7 +273,7 @@ impl Server {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::new();
+    let server = Server::new().await;
     server.start("127.0.0.1:8080".parse()?).await?;
     Ok(())
 }
