@@ -1,15 +1,11 @@
-use std::io::Cursor;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use byteorder::{BigEndian, ReadBytesExt};
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::time::Duration;
-use tokio::time::timeout;
-
-const TIMEOUT_DURATION: Duration = Duration::from_secs(15);
-
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, mpsc};
+use std::ptr;
+#[derive(Debug, Clone)]
 struct MsgBlock {
     magic: u32,
     cmd: u32,
@@ -19,40 +15,62 @@ struct MsgBlock {
     data: Vec<u8>,
 }
 
+
 struct ClientManager {
     client_msg: Arc<Mutex<HashMap<u32, BTreeMap<u32, Vec<u8>>>>>,
-    socket_map: Arc<Mutex<HashMap<u32, Vec<Arc<Mutex<TcpStream>>>>>>,
     except_id: Arc<Mutex<HashMap<u32, u32>>>,
     sender_id: Arc<Mutex<HashMap<u32, u32>>>,
+    connect_num: Arc<Mutex<HashMap<u32, u32>>>,
+    broadcast_sender: Arc<Mutex<HashMap<u32, Vec<mpsc::Sender<Vec<u8>>>>>>,
+    pending_messages: Arc<Mutex<HashMap<u32, VecDeque<(u32, Vec<u8>)>>>>,
 }
 
 impl ClientManager {
     fn new() -> Self {
         ClientManager {
             client_msg: Arc::new(Mutex::new(HashMap::new())),
-            socket_map: Arc::new(Mutex::new(HashMap::new())),
             except_id: Arc::new(Mutex::new(HashMap::new())),
             sender_id: Arc::new(Mutex::new(HashMap::new())),
+            connect_num: Arc::new(Mutex::new(HashMap::new())),
+            broadcast_sender: Arc::new(Mutex::new(HashMap::new())),
+            pending_messages: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn handle_msg(&self, msg_block: MsgBlock) {
         let client_id = msg_block.client_id;
         let client_seq = msg_block.seq;
-        let mut client_msg_map = self.client_msg.lock().await;
-        client_msg_map
-            .entry(client_id)
-            .or_insert_with(BTreeMap::new)
-            .insert(client_seq, msg_block.data);
+
+        let mut pending_messages = self.pending_messages.lock().await;
+        let pending = pending_messages.entry(client_id).or_insert_with(VecDeque::new);
+        pending.push_back((client_seq, msg_block.data));
+
+        self.process_pending_messages(client_id, pending).await;
+    }
+
+    async fn process_pending_messages(&self, client_id: u32, pending: &mut VecDeque<(u32, Vec<u8>)>) {
         let mut except_id_map = self.except_id.lock().await;
-        let except_id = *except_id_map.entry(client_id).or_insert(0);
-        if let Some(data_map) = client_msg_map.get_mut(&client_id) {
-            if let Some(recv_data) = data_map.get(&except_id) {
-                self.write_to(client_id, recv_data.clone()).await;
-                // println!("回写");
-                data_map.remove(&except_id);
-                except_id_map.insert(client_id, except_id + 1);
+        let mut except_id = *except_id_map.entry(client_id).or_insert(0);
+
+        let mut to_write = Vec::new();
+
+        while let Some(&(seq, _)) = pending.front() {
+            if seq == except_id {
+                let (_, data) = pending.pop_front().unwrap();
+                to_write.push(data);
+                except_id += 1;
+            } else if seq < except_id {
+                pending.pop_front();
+            } else {
+                break;
             }
+        }
+
+        *except_id_map.get_mut(&client_id).unwrap() = except_id;
+        drop(except_id_map);
+
+        for data in to_write {
+            self.write_to(client_id, data).await;
         }
     }
 
@@ -80,128 +98,128 @@ impl ClientManager {
         serialized.extend_from_slice(&msg_block.seq.to_be_bytes());
         serialized.extend_from_slice(&msg_block.data);
 
-        let socket_map = self.socket_map.lock().await;
-        if let Some(sockets) = socket_map.get(&client_id) {
-            for socket_arc in sockets {
-                let mut socket = socket_arc.lock().await;
-                if let Err(e) = socket.write_all(&serialized).await {
-                    eprintln!("Failed to write to socket for client {}: {}", client_id, e);
-                }
+        let senders = {
+            let broadcast_sender = self.broadcast_sender.lock().await;
+            broadcast_sender.get(&client_id).cloned().unwrap_or_default()
+        };
+
+        for sender in senders {
+            if let Err(e) = sender.send(serialized.clone()).await {
+                eprintln!("Failed to send message: {}", e);
             }
-        } else {
-            println!("No sockets found for client {}", client_id);
+        }
+    }
+
+    async fn add_client_connection(&self, client_id: u32, tx: mpsc::Sender<Vec<u8>>) {
+        let mut connect_num = self.connect_num.lock().await;
+        *connect_num.entry(client_id).or_insert(0) += 1;
+
+        let mut broadcast_sender = self.broadcast_sender.lock().await;
+        broadcast_sender.entry(client_id).or_default().push(tx);
+    }
+
+    async fn remove_client_connection(&self, client_id: u32, tx: &mpsc::Sender<Vec<u8>>) {
+        let mut connect_num = self.connect_num.lock().await;
+        let mut broadcast_sender = self.broadcast_sender.lock().await;
+
+        if let Some(count) = connect_num.get_mut(&client_id) {
+            *count -= 1;
+            if *count <= 0 {
+                connect_num.remove(&client_id);
+                self.client_msg.lock().await.remove(&client_id);
+                self.except_id.lock().await.remove(&client_id);
+                self.sender_id.lock().await.remove(&client_id);
+                broadcast_sender.remove(&client_id);
+                println!("Client {} fully disconnected", client_id);
+            } else if let Some(senders) = broadcast_sender.get_mut(&client_id) {
+                senders.retain(|s| !ptr::eq(s, tx));
+            }
         }
     }
 }
 
 struct Server {
     client_manager: Arc<ClientManager>,
-    client_id2addr: Arc<Mutex<HashMap<u32, HashSet<String>>>>,
-    client_addr2id: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl Server {
     fn new() -> Self {
         Server {
             client_manager: Arc::new(ClientManager::new()),
-            client_id2addr: Arc::new(Mutex::new(HashMap::new())),
-            client_addr2id: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("0.0.0.0:8080").await?;
-        println!("Server listening on 0.0.0.0:8080");
+    async fn start(&self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(addr).await?;
+        println!("Server listening on {}", addr);
 
         loop {
             let (socket, addr) = listener.accept().await?;
-            // println!("New client connected: {}", addr);
-
-            let socket_arc = Arc::new(tokio::sync::Mutex::new(socket));
-            let socket_clone = Arc::clone(&socket_arc);
             let client_manager = self.client_manager.clone();
-            let client_id2addr_clone = self.client_id2addr.clone();
-            let client_addr2id_clone = self.client_addr2id.clone();
-            let client_addr2id_clone2 = self.client_addr2id.clone();
-            let socket_address: String = addr.to_string();
 
             tokio::spawn(async move {
-                Self::handle_client(
-                    socket_clone,
-                    client_manager,
-                    client_id2addr_clone,
-                    client_addr2id_clone,
-                    client_addr2id_clone2,
-                    socket_address,
-                ).await;
+                Self::handle_client(socket, client_manager, addr).await;
             });
         }
     }
 
-    async fn handle_client(
-        socket_clone: Arc<Mutex<TcpStream>>,
-        client_manager: Arc<ClientManager>,
-        client_id2addr_clone: Arc<Mutex<HashMap<u32, HashSet<String>>>>,
-        client_addr2id_clone: Arc<Mutex<HashMap<String, u32>>>,
-        client_addr2id_clone2: Arc<Mutex<HashMap<String, u32>>>,
-        socket_address: String,
-    ) {
-        let mut is_has_clientid = false;
+    async fn handle_client(socket: TcpStream, client_manager: Arc<ClientManager>, addr: SocketAddr) {
+        let (mut reader, mut writer) = socket.into_split();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+
+        let mut client_id = None;
+
+        tokio::spawn(async move {
+            while let Some(data) = rx.recv().await {
+                if let Err(e) = writer.write_all(&data).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    break;
+                }
+            }
+        });
+
         loop {
-            let msg_block = match Self::read_msg_block(&socket_clone).await {
+            let msg_block = match Self::read_msg_block(&mut reader).await {
                 Ok(Some(block)) => block,
                 Ok(None) => break,
-                Err(_e) => {
-                    // eprintln!("Error reading message: {}", _e);
+                Err(e) => {
+                    eprintln!("Error reading message: {}", e);
                     break;
                 }
             };
-            is_has_clientid = true;
-            // println!("{} #### {}", socket_address, msg_block.client_id);
-            {
-                let mut b = client_addr2id_clone.lock().await;
-                if !b.contains_key(&socket_address) {
-                    let mut socket_map = client_manager.socket_map.lock().await;
-                    socket_map.entry(msg_block.client_id).or_insert_with(Vec::new).push(socket_clone.clone());
-                }
-                b.entry(socket_address.clone()).or_insert(msg_block.client_id);
-            }
-            {
-                let mut a = client_id2addr_clone.lock().await;
-                a.entry(msg_block.client_id).or_insert_with(HashSet::new).insert(socket_address.clone());
+
+            if client_id.is_none() {
+                client_id = Some(msg_block.client_id);
+                client_manager.add_client_connection(msg_block.client_id, tx.clone()).await;
+                println!("New connection for client {}: {}", msg_block.client_id, addr);
             }
 
             client_manager.handle_msg(msg_block).await;
         }
-        if is_has_clientid {
-            // 当连接关闭时，从 HashMap 中移除这个 socket
-            Self::remove_disconnected_client(&client_manager, &client_addr2id_clone2, &socket_address, &socket_clone).await;
+
+        if let Some(id) = client_id {
+            client_manager.remove_client_connection(id, &tx).await;
+            println!("Connection closed for client {}: {}", id, addr);
         }
     }
 
-    async fn read_msg_block(socket_clone: &Arc<Mutex<TcpStream>>) -> Result<Option<MsgBlock>, Box<dyn std::error::Error>> {
+    async fn read_msg_block(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<Option<MsgBlock>, std::io::Error> {
         let mut header = [0u8; 20];
-        let mut socket = socket_clone.lock().await;
-        match timeout(TIMEOUT_DURATION, socket.read_exact(&mut header)).await {
-            Ok(Ok(0)) => return Ok(None), // Connection closed
-            Ok(Ok(_)) => (),
-            Ok(Err(e)) => return Err(Box::new(e)),
-            Err(_) => return Err("Read operation timed out".into()),
+        if let Err(e) = reader.read_exact(&mut header).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(e);
         }
 
-        let mut cursor = Cursor::new(header);
-        let magic = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
-        let cmd = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
-        let client_id = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
-        let data_size = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
-        let seq = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
-
-        if magic != 0x11223344 {
-            return Err("Invalid magic number".into());
-        }
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let cmd = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        let client_id = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+        let data_size = u32::from_be_bytes([header[12], header[13], header[14], header[15]]);
+        let seq = u32::from_be_bytes([header[16], header[17], header[18], header[19]]);
 
         let mut data = vec![0u8; data_size as usize];
-        socket.read_exact(&mut data).await?;
+        reader.read_exact(&mut data).await?;
 
         Ok(Some(MsgBlock {
             magic,
@@ -212,33 +230,11 @@ impl Server {
             data,
         }))
     }
-
-    async fn remove_disconnected_client(
-        client_manager: &ClientManager,
-        client_addr2id: &Arc<Mutex<HashMap<String, u32>>>,
-        socket_address: &str,
-        socket_clone: &Arc<Mutex<TcpStream>>,
-    ) {
-        let mut client_msg = client_manager.client_msg.lock().await;
-        let mut except_id = client_manager.except_id.lock().await;
-        let mut sender_id = client_manager.sender_id.lock().await;
-        let client_id = client_addr2id.lock().await.get(socket_address).unwrap().clone();
-        let mut map = client_manager.socket_map.lock().await;
-        if let Some(sockets) = map.get_mut(&client_id) {
-            sockets.retain(|s| !Arc::ptr_eq(s, socket_clone));
-            if sockets.is_empty() {
-                map.remove(&client_id);
-                except_id.remove(&client_id);
-                client_msg.remove(&client_id);
-                sender_id.remove(&client_id);
-                println!("Client {} disconnected", client_id);
-            }
-        }
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::new();
-    server.run().await
+    server.start("127.0.0.1:8080".parse()?).await?;
+    Ok(())
 }
