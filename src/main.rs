@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet, BTreeMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::Duration;
-use lazy_static::lazy_static;
 use tokio::time::timeout;
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(15);
@@ -152,8 +151,8 @@ impl Server {
             let msg_block = match Self::read_msg_block(&socket_clone).await {
                 Ok(Some(block)) => block,
                 Ok(None) => break,
-                Err(e) => {
-                    // eprintln!("Error reading message: {}", e);
+                Err(_e) => {
+                    // eprintln!("Error reading message: {}", _e);
                     break;
                 }
             };
@@ -174,7 +173,7 @@ impl Server {
 
             client_manager.handle_msg(msg_block).await;
         }
-        if (is_has_clientid) {
+        if is_has_clientid {
             // 当连接关闭时，从 HashMap 中移除这个 socket
             Self::remove_disconnected_client(&client_manager, &client_addr2id_clone2, &socket_address, &socket_clone).await;
         }
